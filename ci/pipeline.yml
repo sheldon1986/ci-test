@@ -1,19 +1,19 @@
 resources:
 
-  - name: repo-release
+  - name: repo-develop
     type: git
     source:
       uri: git@github.com:sheldon1986/ci-test.git
       branch: develop
       private_key: {{github-private-key}}
     check_every: 10s # for demo
-    #  - name: repo-release
-    #    type: git
-    #    source:
-    #      uri: git@github.com:sheldon1986/ci-test.git
-    #      branch: release
-    #      private_key: {{github-private-key}}
-    #    check_every: 10s # for demo
+  - name: repo-release
+    type: git
+    source:
+      uri: git@github.com:sheldon1986/ci-test.git
+      branch: release
+      private_key: {{github-private-key}}
+    check_every: 10s # for demo
   - name: repo-master
     type: git
     source:
@@ -21,6 +21,15 @@ resources:
       branch: master
       private_key: {{github-private-key}}
     check_every: 10s # for demo
+  - name: version
+    type: semver
+    source:
+      uri: git@github.com:sheldon1986/ci-test.git
+      branch: version
+      private_key: {{github-private-key}}
+      file: version
+      driver: git
+      initial_version: 0.5.0
   - name: cf-prod
     type: cf
     source:
@@ -52,9 +61,46 @@ resources:
     type: docker-image
     source:
       repository: making/m2
+      # username: {-{docker-username}}
+      # password: {-{docker-password}}
+      # email: {-{docker-email}}
 
 jobs:
   - name: test-develop
+    serial: true
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-develop
+          trigger: true
+        - get: m2
+      - task: unit
+        file: repo/ci/tasks/unit.yml
+#      - put: tracker
+#        params:
+#          repos:
+#          - repo
+
+  - name: deploy-develop
+    serial: true
+    public: false
+    plan:
+      - aggregate:
+        - get: m2
+        - get:  repo
+          resource: repo-develop
+          passed: [ test-develop ]
+          trigger: true
+      - task: build
+        file: repo/ci/tasks/build.yml
+      - put: cf-dev
+        params:
+          manifest: repo/manifest-dev.yml
+          path: output/demo.jar
+          current_app_name: concourse-ci-demo-minseok-dev
+
+  - name: test-release
     serial: true
     public: true
     plan:
@@ -66,7 +112,7 @@ jobs:
       - task: unit
         file: repo/ci/tasks/unit.yml
 
-  - name: deploy-develop
+  - name: deploy-staging
     serial: true
     public: false
     plan:
@@ -74,40 +120,7 @@ jobs:
         - get: m2
         - get:  repo
           resource: repo-release
-          passed: [ test-develop ]
-          trigger: true
-      - task: build
-        file: repo/ci/tasks/build.yml
-      - put: cf-dev
-        params:
-          manifest: repo/manifest-dev.yml
-          path: output/demo.jar
-          current_app_name: concourse-ci-demo-dev
-
-  - name: pass-dev
-    #    serial: true
-    #    public: true
-    plan:
-      - aggregate:
-        - get: repo
-          resource: repo-release
-        - get: cf-dev
-          passed: [ deploy-develop ]
-          trigger: false
-          #        - get: m2
-          #      - task: unit
-          #        file: repo/ci/tasks/unit.yml
-    
-    
-  - name: deploy-staging
-    serial: true
-    public: false
-    plan:
-      - aggregate:
-        - get: m2
-        - get: repo
-          resource: repo-release
-          passed: [ pass-dev ]
+          passed: [ test-release ]
           trigger: true
       - task: build
         file: repo/ci/tasks/build.yml
@@ -115,24 +128,102 @@ jobs:
         params:
           manifest: repo/manifest-staging.yml
           path: output/demo.jar
-          current_app_name: concourse-ci-demo-staging
+          current_app_name: concourse-ci-demo-minseok-staging
 
-  - name: merge-deployment-to-master
+  - name: merge-release-to-master
     public: true
     plan:
       - aggregate:
         - get: repo
           resource: repo-master
-        - get: cf-staging
-          passed: [ deploy-staging ]
-          trigger: true
-      - task: merge-deployment-to-master
-        file: repo/ci/tasks/merge-release-branch.yml
+        - get: repo-release
+          passed: [ test-release ]
+      - task: merge-release-to-master
+        file: repo-release/ci/tasks/merge-release-branch.yml
         params:
           GIT_EMAIL: {{git-email}}
           GIT_NAME: {{git-name}}
       - put: repo
         resource: repo-master
+        params:
+          repository: out
+
+  - name: test-master
+    serial: true
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-master
+          # comment out bellow to support hotfix
+          passed: [ merge-release-to-master ]
+          trigger: true
+        - get: m2
+      - task: unit
+        file: repo/ci/tasks/unit.yml
+
+  - name: tag-master
+    public: true
+    plan:
+      - aggregate:
+        - get:  repo
+          resource: repo-master
+          passed: [ test-master ]
+          trigger: true
+        - get: repo-release
+        - get: version
+        - get: m2
+      - task: bump-to-release-version
+        file: repo-release/ci/tasks/bump-to-release-version.yml
+        params:
+          GIT_EMAIL: {{git-email}}
+          GIT_NAME: {{git-name}}
+      - put: repo
+        resource: repo-master
+        params:
+          repository: out
+          tag: version/number
+
+  - name: bump-version
+    public: true
+    plan:
+      - aggregate:
+        - get:  repo-master
+          passed: [ tag-master ]
+          trigger: true
+        - get:  repo
+          resource: repo-release
+        - get: version
+          params: {bump: minor}
+        - get: m2
+      - task: bump-to-next-develop-version
+        file: repo/ci/tasks/bump-to-next-develop-version.yml
+        params:
+          GIT_EMAIL: {{git-email}}
+          GIT_NAME: {{git-name}}
+      - put: repo
+        resource: repo-release
+        params:
+          repository: out
+      - put: version
+        params: {file: version/number}
+
+  - name: merge-release-to-develop
+    public: true
+    plan:
+      - aggregate:
+        - get: repo
+          resource: repo-develop
+        - get: repo-release
+          passed: [ bump-version ]
+          trigger: true
+      - task: merge-release-to-develop
+        file: repo-release/ci/tasks/merge-release-branch.yml
+        params:
+          GIT_EMAIL: {{git-email}}
+          GIT_NAME: {{git-name}}
+      - put: repo
+        resource: repo-develop
         params:
           repository: out
 
@@ -144,7 +235,7 @@ jobs:
         - get: m2
         - get:  repo
           resource: repo-master
-          passed: [ merge-deployment-to-master ]
+          passed: [ tag-master ]
           trigger: true
       - task: build
         file: repo/ci/tasks/build.yml
@@ -152,4 +243,4 @@ jobs:
         params:
           manifest: repo/manifest.yml
           path: output/demo.jar
-          current_app_name: concourse-ci-demo-prod
+          current_app_name: concourse-ci-demo-minseok
